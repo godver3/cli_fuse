@@ -2,11 +2,11 @@ version: '3.8'
 
 services:
   fuse_translation:
-    build: .
+    image: godver3/fuse_translate:latest
     ports:
       - "${PORT:-6000}:6000"
     volumes:
-      - /path/to/translated/mnt:/mnt/translated
+      - /path/to/translated/mnt:/mnt/translated:rshared
       - /path/to/original/mnt:/mnt/original
       - /path/to/database:/app/database
       - /path/to/database/backups:/app/backups
@@ -14,3 +14,9 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     command: python main.py /mnt/translated /mnt/original database/translations.db backups
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
