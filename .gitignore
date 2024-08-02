@@ -3,3 +3,4 @@ backups/*
 database/*
 *.log
 *pycache*
+local-docker-compose.yml

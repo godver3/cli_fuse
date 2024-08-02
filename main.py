@@ -5,7 +5,7 @@ from translation_fs import TranslationFS
 from api import run_flask
 import threading
 
-logging.basicConfig(filename='fuse_translation.log', level=logging.DEBUG,
+logging.basicConfig(filename='logs/fuse_translation.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 def main(mountpoint, root, db_file, backup_dir):
