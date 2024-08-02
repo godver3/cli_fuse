@@ -20,3 +20,4 @@ services:
       - /dev/fuse
     security_opt:
       - apparmor:unconfined
+    restart: always
