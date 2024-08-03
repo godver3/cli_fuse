@@ -7,7 +7,7 @@ services:
       - "${PORT:-6000}:6000"
     volumes:
       - /path/to/translated/mnt:/mnt/translated:rshared
-      - /path/to/original/mnt:/mnt/original
+      - /path/to/original/mnt:/mnt/original:rshared
       - /path/to/database:/app/database
       - /path/to/database/backups:/app/backups
       - /path/to/logs:/app/logs

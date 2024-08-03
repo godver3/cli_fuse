@@ -27,7 +27,7 @@ def main(mountpoint, root, db_file, backup_dir):
     api_thread.start()
 
     logging.info(f"Mounting at {mountpoint}, root: {root}, database file: {db_file}")
-    FUSE(fuse_fs, mountpoint, nothreads=True, foreground=True, ro=True)
+    FUSE(fuse_fs, mountpoint, nothreads=True, foreground=True, ro=True, allow_other=True)
 
 if __name__ == '__main__':
     import sys

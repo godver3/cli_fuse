@@ -9,6 +9,9 @@ RUN apk add --no-cache \
     musl-dev \
     python3-dev
 
+# Set up FUSE configuration
+RUN echo "user_allow_other" >> /etc/fuse.conf
+
 # Set the working directory in the container
 WORKDIR /app
 

@@ -1,5 +1,5 @@
-from flask import Flask, request, jsonify
 import logging
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -38,3 +38,16 @@ def list_translations():
     logging.info("Received list_translations request")
     translations = app.config['FUSE_FS'].list_translations()
     return jsonify({"translations": translations}), 200
+
+@app.route('/purge_all_translations', methods=['POST'])
+def purge_all_translations():
+    logging.info("Received purge_all_translations request")
+    try:
+        success = app.config['FUSE_FS'].purge_all_translations()
+        if success:
+            return jsonify({"status": "success", "message": "All translations purged successfully"}), 200
+        else:
+            return jsonify({"status": "error", "message": "Failed to purge translations"}), 500
+    except Exception as e:
+        logging.error(f"Error during purge_all_translations: {str(e)}")
+        return jsonify({"status": "error", "message": f"An error occurred: {str(e)}"}), 500
