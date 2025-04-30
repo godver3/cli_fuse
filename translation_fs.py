@@ -623,9 +623,54 @@ class TranslationFS(Operations):
         logging.debug(f"Released file handle for {path} -> {full_p}")
         return 0
 
+    def _get_full_path_if_untranslated(self, fuse_path):
+        """
+        Helper to get the potential full physical path IF the fuse_path
+        is NOT currently covered by a translation (exact or parent).
+        Returns None if the path IS translated or doesn't map cleanly.
+        """
+        norm_fuse_path = os.path.normpath(fuse_path)
+        with self.fs_lock:
+            # Check direct translation
+            if norm_fuse_path in self.reverse_translations:
+                logging.debug(f"_get_full_path_if_untranslated: Path '{norm_fuse_path}' is directly translated.")
+                return None # Path is translated
+
+            # Check parent translation
+            parts = norm_fuse_path.strip('/').split('/')
+            current_check_path = '/'
+            # Iterate through potential parent paths
+            # Example: /a/b/c -> check /, /a, /a/b, /a/b/c
+            for i, part in enumerate(parts):
+                if not part: continue # Skip empty parts resulting from split('/') or normpath
+
+                if i == 0 and norm_fuse_path.startswith('/'):
+                    current_check_path = '/' + part # Handle root level
+                elif current_check_path == '/':
+                     current_check_path = '/' + part # Handle first part after root if root wasn't checked yet
+                else:
+                    current_check_path = os.path.join(current_check_path, part)
+
+                logging.debug(f"_get_full_path_if_untranslated: Checking parent '{current_check_path}' for translation.")
+                if current_check_path in self.reverse_translations:
+                    logging.debug(f"_get_full_path_if_untranslated: Path '{norm_fuse_path}' is under translated parent '{current_check_path}'.")
+                    return None # Path is under a translated parent
+
+        # If no translation found, calculate potential physical path
+        try:
+            # Assume if it's not translated, it maps directly relative to root
+            path_relative_to_root = norm_fuse_path.lstrip('/')
+            full = os.path.join(self.root, path_relative_to_root)
+            logging.debug(f"_get_full_path_if_untranslated: Path '{norm_fuse_path}' is untranslated, maps to '{full}'.")
+            return full
+        except Exception as e:
+             logging.error(f"_get_full_path_if_untranslated: Error calculating physical path for '{norm_fuse_path}': {e}")
+             return None
+
     def rename(self, old, new):
         logging.info(f"rename called: {old} -> {new}")
 
+        # Resolve the *original* filesystem path for the FUSE path being renamed ('old')
         original_old_path = self._translate_path(old)
         full_original_old = os.path.join(self.root, original_old_path.lstrip('/'))
 
@@ -633,19 +678,108 @@ class TranslationFS(Operations):
             logging.error(f"Rename failed: Source '{old}' (original: '{original_old_path}') does not exist.")
             raise FuseOSError(ENOENT)
 
+        # Normalize paths
+        norm_original_old_path = os.path.normpath(original_old_path)
+        norm_target_fuse_path = os.path.normpath(new)
+        logging.debug(f"Rename normalized: original='{norm_original_old_path}', target='{norm_target_fuse_path}'")
+
+        # --- Pre-checks ---
+        db_op = None
+        db_args = None
+
+        # 1. Check for renaming item into itself or its descendants
+        #    (e.g., mv /dir /dir/subdir or mv /file /file/invalid)
+        #    Also handles renaming back to the exact original path.
+        if norm_target_fuse_path == norm_original_old_path or norm_target_fuse_path.startswith(norm_original_old_path.rstrip('/') + '/'):
+             # If target is the same as original, we remove the translation
+             if norm_target_fuse_path == norm_original_old_path:
+                 logging.info(f"Detected rename back to original path: {old} ({norm_original_old_path}) -> {new}. Removing translation.")
+                 db_op = self._remove_translation
+                 db_args = (norm_original_old_path,)
+             else:
+                 # Target is inside the original path - this is invalid for virtual renames
+                 logging.error(f"Rename failed: Cannot rename '{old}' (original: '{norm_original_old_path}') into itself ('{new}').")
+                 raise FuseOSError(EINVAL) # Invalid argument
+        else:
+            # Standard rename (not into self, not back to original)
+
+            # 2. Check if renaming TO a path that is currently an ancestor of the original path's FUSE representation ('old')
+            #    (e.g. mv /a/b/c /a ) - This is disallowed by standard 'mv'
+            #    Need to use the 'old' FUSE path for this check, not the translated original path.
+            norm_old_fuse_path = os.path.normpath(old)
+            if norm_old_fuse_path.startswith(norm_target_fuse_path.rstrip('/') + '/'):
+                 logging.error(f"Rename failed: Cannot rename '{old}' to an ancestor directory '{new}'.")
+                 raise FuseOSError(EINVAL)
+
+            # 3. Check if the target path conflicts with an existing *physical* path
+            #    that isn't already managed by a translation we're about to overwrite.
+            potential_physical_target = self._get_full_path_if_untranslated(norm_target_fuse_path)
+            target_physically_exists = potential_physical_target and os.path.lexists(potential_physical_target) # Use lexists for symlinks
+
+            if target_physically_exists:
+                 # Target physically exists. Is it okay to overwrite?
+                 # It's okay *only* if the target FUSE path is ALREADY translated
+                 # (meaning we are just changing where an existing translation points).
+                 with self.fs_lock:
+                      is_target_fuse_path_translated = norm_target_fuse_path in self.reverse_translations
+                 if not is_target_fuse_path_translated:
+                      logging.error(f"Rename failed: Target '{new}' conflicts with an existing physical path '{potential_physical_target}' that is not managed by a translation.")
+                      raise FuseOSError(errno.EEXIST) # Target exists and isn't virtual
+                 else:
+                      logging.debug(f"Target '{new}' conflicts with physical path '{potential_physical_target}', but target FUSE path is already translated. Allowing overwrite.")
+
+            # If all checks pass, queue the add/update operation
+            logging.info(f"Adding/updating translation for rename: {old} ({norm_original_old_path}) -> {new} ({norm_target_fuse_path})")
+            db_op = self._add_translation
+            db_args = (norm_original_old_path, norm_target_fuse_path)
+
+        # --- Execute DB operation ---
+        if db_op is None or db_args is None:
+             # Should not happen if logic above is correct, but as a safeguard:
+             logging.error("Rename failed: Internal logic error, no DB operation determined.")
+             raise FuseOSError(EACCES) # Generic error
+
         result_queue = Queue()
-        self.db_queue.put((self._add_translation, (original_old_path, new), result_queue))
+        self.db_queue.put((db_op, db_args, result_queue))
 
         try:
-            success_or_error = result_queue.get(timeout=5)
-            if isinstance(success_or_error, Exception) or not success_or_error:
-                logging.error(f"Rename failed: DB update failed for {original_old_path} -> {new}")
-                raise FuseOSError(EACCES)
+            success_or_error = result_queue.get(timeout=10) # Increased timeout slightly
+
+            # Check if the operation returned an error (Exception)
+            if isinstance(success_or_error, Exception):
+                 logging.error(f"Rename failed: DB worker returned an exception: {success_or_error}")
+                 raise FuseOSError(getattr(success_or_error, 'errno', EACCES))
+            # Check if the operation returned False (indicating failure or no-op)
+            elif not success_or_error:
+                 if db_op == self._add_translation:
+                     logging.error(f"Rename failed: DB add/update operation returned False for {norm_original_old_path} -> {norm_target_fuse_path}")
+                     raise FuseOSError(EACCES) # DB Error during add/update
+                 else: # db_op == self._remove_translation
+                      logging.info(f"Rename to original: DB remove operation returned False (likely no existing translation found), proceeding.")
+                      # Still invalidate caches, as memory state might have been briefly inconsistent
+                      self._get_full_path.cache_clear()
+                      self.file_handle_cache.invalidate(old)
+                      self.file_handle_cache.invalidate(new) # new == original here
+
+            # Operation succeeded (True)
             else:
-                logging.info(f"Rename successful: '{old}' ({original_old_path}) is now mapped to '{new}'")
-                return 0
+                logging.info(f"Rename DB operation successful for {old} -> {new}")
+                # Invalidate caches after successful add or remove
+                self._get_full_path.cache_clear()
+                self.file_handle_cache.invalidate(old)
+                self.file_handle_cache.invalidate(new)
+
+            # Trigger update check in case external tools rely on mtime
+            self.update_event.set()
+            return 0 # Success
+
         except Empty:
             logging.error("Rename failed: DB worker timed out.")
+            raise FuseOSError(EACCES) # Consider ETIMEDOUT if available/appropriate
+        except FuseOSError:
+            raise
+        except Exception as e:
+            logging.exception(f"Unexpected error handling rename result for {old} -> {new}")
             raise FuseOSError(EACCES)
 
     def write(self, path, data, offset, fh):
