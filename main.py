@@ -2,8 +2,6 @@ import os
 import logging
 from fuse import FUSE
 from translation_fs import TranslationFS
-from api import run_flask
-import threading
 
 logging.basicConfig(filename='logs/fuse_translation.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,15 +17,10 @@ def main(mountpoint, root, db_file, backup_dir):
     else:
         logging.info(f"Database file {db_file} does not exist. A new one will be created.")
 
-    global fuse_fs
     fuse_fs = TranslationFS(root, db_file, backup_dir)
 
-    # Start Flask API in a separate thread
-    api_thread = threading.Thread(target=run_flask, args=(fuse_fs,))
-    api_thread.start()
-
-    logging.info(f"Mounting at {mountpoint}, root: {root}, database file: {db_file}")
-    FUSE(fuse_fs, mountpoint, nothreads=True, foreground=True, ro=True, allow_other=True)
+    logging.info(f"Mounting RW at {mountpoint}, root: {root}, database file: {db_file}")
+    FUSE(fuse_fs, mountpoint, nothreads=True, foreground=True, allow_other=True)
 
 if __name__ == '__main__':
     import sys
