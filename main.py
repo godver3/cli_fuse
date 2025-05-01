@@ -20,7 +20,7 @@ def main(mountpoint, root, db_file, backup_dir):
     fuse_fs = TranslationFS(root, db_file, backup_dir)
 
     logging.info(f"Mounting RW at {mountpoint}, root: {root}, database file: {db_file}")
-    FUSE(fuse_fs, mountpoint, nothreads=True, foreground=True, allow_other=True)
+    FUSE(fuse_fs, mountpoint, nothreads=True, foreground=True, nonempty=True, allow_other=True)
 
 if __name__ == '__main__':
     import sys
