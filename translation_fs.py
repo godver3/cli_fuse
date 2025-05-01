@@ -76,6 +76,7 @@ class TranslationFS(Operations):
         self.file_handle_cache = FileHandleCache()
         self.read_buffer_size = 1024 * 1024
         self.explicit_virtual_dirs = set()
+        self.physically_empty_parents = set()
 
         self.conn = self.create_connection()
         self.create_table()
@@ -333,6 +334,7 @@ class TranslationFS(Operations):
 
             self.update_event.set()
             logging.info(f"Translation added/updated: {original} -> {translated}")
+            self._check_and_update_parent_emptiness(original)
             return True
 
         except sqlite3.Error as e:
@@ -359,11 +361,23 @@ class TranslationFS(Operations):
                     del self.dir_structure[trans_dir]
                     remove_virtual_dirs(self.virtual_dirs, self.dir_structure, self.explicit_virtual_dirs, trans_dir)
 
+            original_parent = os.path.dirname(original)
+            if original_parent and original_parent != '/':
+                try:
+                    physical_parent_path = self._get_full_path(original_parent)
+                    if physical_parent_path in self.physically_empty_parents:
+                        logging.info(f"Translation removed for child of {physical_parent_path}. Unmarking as empty.")
+                        self.physically_empty_parents.discard(physical_parent_path)
+                except FuseOSError:
+                    pass # Parent might not map physically anymore
+
     def _remove_translation(self, original):
         logging.debug(f"DB Worker: Removing translation for: {original}")
+        t_start = time.time()
         try:
             with self.fs_lock:
                 translated = self.translations.get(original)
+            t_lock1 = time.time()
 
             if not translated:
                 logging.warning(f"Attempted to remove non-existent translation for {original}")
@@ -374,15 +388,30 @@ class TranslationFS(Operations):
                 cursor.execute('DELETE FROM translations WHERE original = ?', (original,))
                 self.conn.commit()
                 cursor.close()
+            t_db = time.time()
 
             with self.fs_lock:
                 self._remove_from_memory(original, translated)
+            t_mem = time.time()
 
             self._get_full_path.cache_clear()
             self.file_handle_cache.close_all()
+            t_cache = time.time()
 
             self.update_event.set()
             logging.info(f"Removed translation for: {original} (was {translated})")
+
+            # Check parent emptiness *after* logging removal
+            self._check_and_update_parent_emptiness(original)
+            t_parent_check = time.time()
+
+            logging.debug(f"Timing for remove {original}: "
+                          f"Lock1={t_lock1-t_start:.4f}s, "
+                          f"DB={t_db-t_lock1:.4f}s, "
+                          f"Mem={t_mem-t_db:.4f}s, "
+                          f"Cache={t_cache-t_mem:.4f}s, "
+                          f"ParentCheck={t_parent_check-t_cache:.4f}s, "
+                          f"Total={t_parent_check-t_start:.4f}s")
             return True
         except sqlite3.Error as e:
             logging.error(f"DB Error removing translation {original}: {e}")
@@ -526,28 +555,53 @@ class TranslationFS(Operations):
     def readdir(self, path, fh):
         logging.debug(f"readdir called for path: {path}")
         final_dirents_set = {'.', '..'}
+        special_dirs = {'__all__', '__unplayable__', 'processed'}
 
         full_p = self._get_full_path(path)
         logging.debug(f"readdir physical path: {full_p}")
 
+        physical_path_exists = os.path.exists(full_p)
+        is_physical_dir = os.path.isdir(full_p)
+
         try:
-            if os.path.isdir(full_p):
+            if is_physical_dir:
                 physical_contents = os.listdir(full_p)
                 logging.debug(f"Physical contents for {path}: {physical_contents}")
 
                 with self.fs_lock:
+                    original_parent_path = self._translate_path(path) # Get original path of the parent
+
                     for name in physical_contents:
-                        original_parent_path = self._translate_path(path)
+                        entry_full_path = os.path.join(full_p, name)
+                        is_entry_dir = os.path.isdir(entry_full_path) # Still need this check
+
+                        # Construct original path to check against translations
                         original_entry_path = os.path.join(original_parent_path, name)
                         original_entry_path = os.path.normpath(original_entry_path)
 
-                        if original_entry_path not in self.translations:
-                            final_dirents_set.add(name)
-                            logging.debug(f"Keeping physical entry: {name} (original: {original_entry_path})")
-                        else:
+                        # Skip if the original path is hidden by a translation
+                        if original_entry_path in self.translations:
                             logging.debug(f"Hiding physical entry: {name} (original: {original_entry_path} is translated)")
+                            continue
 
-            elif not os.path.exists(full_p):
+                        # *** The New Check ***
+                        # Check if this physical directory is marked as effectively empty
+                        if is_entry_dir and entry_full_path in self.physically_empty_parents:
+                             logging.debug(f"Hiding directory {name} ({entry_full_path}) as it's marked effectively empty.")
+                             continue
+
+                        # Always show special directories if they exist physically and aren't translated away
+                        if is_entry_dir and name in special_dirs:
+                            final_dirents_set.add(name)
+                            logging.debug(f"Including special directory: {name}")
+                            continue # Go to next item
+
+                        # Include other directories and files (already passed translation and emptiness checks)
+                        final_dirents_set.add(name)
+                        logging.debug(f"Including physical entry: {name}")
+
+
+            elif not physical_path_exists:
                  logging.debug(f"Physical path {full_p} not found, directory might be purely virtual.")
                  with self.fs_lock:
                       if path not in self.dir_structure and path not in self.virtual_dirs:
@@ -852,6 +906,7 @@ class TranslationFS(Operations):
                           self.file_handle_cache.invalidate(norm_target_fuse_path)
 
                           self.update_event.set()
+                          self._check_and_update_parent_emptiness(old)
                           return 0
 
             except Empty:
@@ -943,6 +998,7 @@ class TranslationFS(Operations):
                     self.file_handle_cache.invalidate(norm_target_fuse_path)
 
                 self.update_event.set()
+                self._check_and_update_parent_emptiness(old)
                 return 0
 
             except Empty:
@@ -1282,30 +1338,14 @@ class TranslationFS(Operations):
                         logging.info(f"Queueing removal of translation for original path: {original_path} (triggered by {path})")
 
                         # Queue the actual removal operation to the DB worker thread
-                        result_queue = Queue()
-                        self.db_queue.put((self._remove_translation, (original_path,), result_queue))
+                        # Don't wait for a result here, just queue it.
+                        self.db_queue.put((self._remove_translation, (original_path,), None)) # No result_queue needed
 
-                        try:
-                            success_or_error = result_queue.get(timeout=10) # Wait for DB confirmation
-
-                            if isinstance(success_or_error, Exception):
-                                logging.error(f"setxattr remove failed: DB worker returned an exception: {success_or_error}")
-                                raise FuseOSError(getattr(success_or_error, 'errno', EACCES))
-                            elif not success_or_error:
-                                logging.warning(f"setxattr remove: DB remove operation returned False (maybe already removed?) for {original_path}")
-                                # Still return success to fuse layer if DB says false, as the goal state (no translation) might be met.
-                                return 0
-                            else:
-                                logging.info(f"setxattr remove successful for {original_path}")
-                                self.update_event.set() # Trigger watches/updates
-                                return 0 # Success
-
-                        except Empty:
-                            logging.error("setxattr remove failed: DB worker timed out.")
-                            raise FuseOSError(EACCES) # Or ETIMEDOUT? EACCES is safer.
-                        except Exception as e:
-                            logging.exception(f"Unexpected error waiting for DB result in setxattr for {path}")
-                            raise FuseOSError(EACCES)
+                        # Assume success at this point (task is queued)
+                        # Trigger watches/updates immediately
+                        self.update_event.set()
+                        logging.info(f"setxattr remove for {original_path} queued successfully.")
+                        return 0 # Return success to FUSE immediately
 
                     else:
                         logging.warning(f"setxattr remove failed: Path '{path}' not found in reverse translations.")
@@ -1340,6 +1380,52 @@ class TranslationFS(Operations):
         finally:
             if conn:
                 conn.close()
+
+    def _check_and_update_parent_emptiness(self, original_path):
+        """Checks if the physical parent of original_path is now empty
+           (only contains translated items) and updates the set."""
+        original_parent = os.path.dirname(original_path)
+        if not original_parent or original_parent == '/':
+             return # Cannot hide root or direct children of root this way
+
+        # Map the FUSE parent path to its physical counterpart
+        # This might be tricky if the parent itself is virtual/translated
+        # Let's assume _get_full_path works correctly for the parent.
+        try:
+             physical_parent_path = self._get_full_path(original_parent)
+        except FuseOSError:
+             logging.warning(f"Could not get physical path for parent {original_parent} during emptiness check.")
+             return # Can't check emptiness
+
+        if not os.path.isdir(physical_parent_path):
+            # Parent doesn't exist physically or isn't a dir, shouldn't happen if child existed.
+            return
+
+        try:
+            physical_contents = os.listdir(physical_parent_path)
+            is_effectively_empty = True
+            for name in physical_contents:
+                # Construct the original path of the sibling
+                potential_original_sibling = os.path.join(original_parent, name)
+                potential_original_sibling = os.path.normpath(potential_original_sibling)
+                # If any sibling is NOT translated, the parent is not effectively empty
+                if potential_original_sibling not in self.translations:
+                    is_effectively_empty = False
+                    break
+
+            if is_effectively_empty:
+                logging.info(f"Physical directory {physical_parent_path} (parent of {original_path}) is now effectively empty. Marking for hiding.")
+                self.physically_empty_parents.add(physical_parent_path)
+            else:
+                # Ensure it's not in the set if it's not empty
+                if physical_parent_path in self.physically_empty_parents:
+                    logging.info(f"Physical directory {physical_parent_path} (parent of {original_path}) is no longer effectively empty. Unmarking.")
+                    self.physically_empty_parents.discard(physical_parent_path)
+
+        except OSError as e:
+            logging.error(f"Error checking emptiness of {physical_parent_path}: {e}")
+            # Safer to assume not empty on error
+            self.physically_empty_parents.discard(physical_parent_path)
 
 def fuse_error_handler(func):
     @functools.wraps(func)
